@@ -1,0 +1,288 @@
+---
+title: "NK_SCDL3991_TFINAL"
+author: "Noah Kentmann"
+date: "2025-06-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Libraries
+library(readxl)
+library(tidyverse)
+library(openxlsx)
+library(lme4)
+library(ggplot2)
+library(ggsignif)
+library(lmerTest)
+library(scales)
+library (ggbreak)
+library(patchwork)
+```
+
+```{r}
+# Paths
+excel_path <- "~/Desktop/NK_SCDL3991_Flow_Data.xlsx"
+output_excel <- "~/Desktop/SCDL3991_Results_FINAL.xlsx"
+
+# Sample groups
+soc_samples <- c("P1", "P2", "P4", "P10", "P21", "P23", "PM1", "PM2", "PM3", "PM5", "PM6", "PM7", "PM9")
+belatacept_samples <- c("P6", "P17", "P20", "P26", "P28", "P32", "PA34", "PA38", "PA39")
+
+# Workbook
+wb <- createWorkbook()
+```
+**Wilcoxon Rank Tests**
+```{r}
+process_marker_timepoint <- function(sheet_name, timepoint) {
+  sheet_name <- as.character(sheet_name)  # <--- ADD THIS LINE
+  df <- read_excel(excel_path, sheet = sheet_name) %>%
+    filter(grepl("_", Sample)) %>%
+    mutate(Sample_ID = sub("_.*", "", Sample),
+           Timepoint = toupper(sub(".*_", "", Sample)),
+           Group = case_when(
+             Sample_ID %in% soc_samples ~ "SOC",
+             Sample_ID %in% belatacept_samples ~ "Belatacept",
+             TRUE ~ NA_character_
+           )) %>%
+    filter(Timepoint == toupper(timepoint), !is.na(Group))
+
+  if (nrow(df) == 0 || length(unique(df$Group)) < 2) return(NULL)
+
+  test <- wilcox.test(Average_Predicted_Concentration ~ Group, data = df, exact = FALSE)
+  U <- test$statistic
+  n1 <- sum(df$Group == "SOC")
+  n2 <- sum(df$Group == "Belatacept")
+  r_rb <- 1 - (2 * U) / (n1 * n2)
+
+  data.frame(Marker = sheet_name, Timepoint = timepoint,
+             W = as.numeric(U), p_value = test$p.value, Rank_Biserial = round(r_rb, 4),
+             N_SOC = n1, N_Belatacept = n2)
+}
+
+all_sheets <- excel_sheets(excel_path)
+sheets_of_interest <- all_sheets[which(all_sheets == "IL-17A"):which(all_sheets == "Granulysin")]
+timepoints <- c("0", "2W", "3M", "6M", "12M")
+
+wilcox_results <- expand.grid(Sheet = sheets_of_interest, Timepoint = timepoints) %>%
+  pmap_dfr(~process_marker_timepoint(..1, ..2)) %>%
+  arrange(Marker, match(Timepoint, timepoints))
+
+addWorksheet(wb, "Wilcoxon Rank Tests")
+writeData(wb, "Wilcoxon Rank Tests", wilcox_results)
+
+```
+**Linear Mixed Model**
+```{r}
+run_lmm_vs_baseline <- function(sample_group, group_label) {
+  results <- list()
+  
+  for (sheet in sheets_of_interest) {
+    df <- read_excel(excel_path, sheet = sheet) %>%
+      filter(grepl("_", Sample)) %>%
+      mutate(Patient = sub("_.*", "", Sample),
+             Timepoint = toupper(sub(".*_", "", Sample))) %>%
+      filter(Patient %in% sample_group)
+
+    timepoints <- setdiff(unique(df$Timepoint), "0")
+    baseline_df <- df %>% filter(Timepoint == "0") %>% select(Patient, Baseline = Average_Predicted_Concentration)
+
+    for (tp in timepoints) {
+      tp_df <- df %>% filter(Timepoint == tp)
+      merged_df <- inner_join(tp_df, baseline_df, by = "Patient")
+
+      if (nrow(merged_df) >= 3) {
+        long_df <- pivot_longer(merged_df, cols = c(Baseline, Average_Predicted_Concentration),
+                                names_to = "Condition", values_to = "Concentration") %>%
+          mutate(Condition = factor(ifelse(Condition == "Baseline", "Baseline", "Followup"),
+                                    levels = c("Baseline", "Followup")))
+
+        model <- tryCatch(lmer(Concentration ~ Condition + (1 | Patient), data = long_df), error = function(e) NULL)
+
+        if (!is.null(model)) {
+          is_singular <- isSingular(model, tol = 1e-4)
+
+          anova_table <- tryCatch(anova(model), error = function(e) NULL)
+          if (!is.null(anova_table) && "Condition" %in% rownames(anova_table)) {
+            pval <- anova_table["Condition", "Pr(>F)"]
+            if (!is.na(pval)) {
+              fval <- anova_table["Condition", "F value"]
+              results[[length(results)+1]] <- data.frame(
+                Protein = sheet,
+                Timepoint = tp,
+                F_value = fval,
+                p_value = pval,
+                Singular_Fit = is_singular
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  bind_rows(results)
+}
+
+soc_lmm <- run_lmm_vs_baseline(soc_samples, "SOC")
+belatacept_lmm <- run_lmm_vs_baseline(belatacept_samples, "Belatacept")
+
+addWorksheet(wb, "LMM - SOC")
+addWorksheet(wb, "LMM - Belatacept")
+writeData(wb, "LMM - SOC", soc_lmm)
+writeData(wb, "LMM - Belatacept", belatacept_lmm)
+```
+**Breaks function for below graphs**
+```{r}
+get_nice_breaks <- function(y_max, n_breaks = 4) {
+  rough_interval <- y_max / n_breaks
+  magnitude <- 10^floor(log10(rough_interval))
+  nice_steps <- c(1, 2, 5, 10)
+  interval <- nice_steps[which.min(abs(nice_steps * magnitude - rough_interval))] * magnitude
+  y_max_nice <- ceiling(y_max / interval) * interval
+  breaks <- seq(0, y_max_nice, by = interval)
+  
+  if (length(breaks) > n_breaks + 1) {
+    interval <- interval * 2
+    y_max_nice <- ceiling(y_max / interval) * interval
+    breaks <- seq(0, y_max_nice, by = interval)
+  }
+  
+  list(breaks = breaks, y_max = y_max_nice)
+}
+```
+**Graphs and statistical summaries**
+```{r}
+custom_titles <- c(
+  "Perforin" = "a) Perforin concentration (pg/mL)",
+  "FasL" = "b) FasL concentration (pg/mL)",
+  "Granulysin" = "c) Granulysin concentration (pg/mL)"
+)
+
+for (marker in sheets_of_interest) {
+  df <- read_excel(excel_path, sheet = marker) %>%
+    filter(grepl("_", Sample)) %>%
+    mutate(Sample_ID = sub("_.*", "", Sample),
+           Timepoint = toupper(sub(".*_", "", Sample)),
+           Group = case_when(
+             Sample_ID %in% soc_samples ~ "SOC",
+             Sample_ID %in% belatacept_samples ~ "Belatacept",
+             TRUE ~ NA_character_
+           )) %>%
+    filter(!is.na(Group))
+
+  summary_df <- df %>%
+    group_by(Timepoint, Group) %>%
+    summarise(Mean = mean(Average_Predicted_Concentration, na.rm = TRUE),
+              SEM = sd(Average_Predicted_Concentration, na.rm = TRUE) / sqrt(n()), .groups = "drop") %>%
+    mutate(Timepoint = factor(recode(Timepoint, !!!time_map), levels = c("0", "0.5", "3", "6", "12")))
+  
+  compute_summary_table <- function(df) {
+  df %>%
+    group_by(Timepoint, Group) %>%
+    summarise(
+      N = sum(!is.na(Average_Predicted_Concentration)),
+      Mean = round(mean(Average_Predicted_Concentration, na.rm = TRUE), 2),
+      SD = round(sd(Average_Predicted_Concentration, na.rm = TRUE), 2),
+      SEM = round(SD / sqrt(N), 2),
+      Min = round(min(Average_Predicted_Concentration, na.rm = TRUE), 2),
+      Max = round(max(Average_Predicted_Concentration, na.rm = TRUE), 2)
+    ) %>%
+    arrange(Timepoint, Group) %>%
+    ungroup()
+}
+
+  sig_df <- final_results %>%
+    filter(Marker == marker, p_value < 0.05) %>%
+    mutate(Timepoint = recode(Timepoint, !!!time_map),
+           Timepoint = factor(Timepoint, levels = c("0", "0.5", "3", "6", "12")))
+
+  raw_y_max <- max(summary_df$Mean + summary_df$SEM, na.rm = TRUE) * 1.05
+  break_info <- get_nice_breaks(raw_y_max, n_breaks = 4)
+  breaks_seq <- break_info$breaks
+  y_max_nice <- break_info$y_max
+
+  group_labels <- c("SOC" = "Standard", "Belatacept" = "Belatacept")
+
+  p <- ggplot(summary_df, aes(x = Timepoint, y = Mean, color = Group, group = Group, shape = Group)) +
+    geom_line(linewidth = 0.5) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Mean - SEM, ymax = Mean + SEM), width = 0.2) +
+    scale_color_manual(values = c("SOC" = "black", "Belatacept" = "deeppink"),
+                       breaks = c("SOC", "Belatacept"), labels = group_labels) +
+    scale_shape_manual(values = c("SOC" = 16, "Belatacept" = 15),
+                       breaks = c("SOC", "Belatacept"), labels = group_labels) +
+    labs(title = ifelse(marker %in% names(custom_titles), custom_titles[marker], marker),
+        x = "Time (months)",
+        y = "Mean Concentration (pg/mL)",
+        color = NULL,
+        shape = NULL) +
+    theme_classic(base_size = 14) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.line = element_line(color = "black", linewidth = 0.8),
+      axis.title = element_text(color = "black", face = "bold", size = 14),
+      axis.text = element_text(color = "black", face = "bold", size = 12),
+      legend.text = element_text(face = "bold", size = 12),
+      legend.position = "right"
+    ) +
+    scale_x_discrete(expand = c(0.05, 0.05)) +
+    scale_y_continuous(
+      limits = c(0, y_max_nice),
+      breaks = breaks_seq,
+      expand = c(0, 0)
+    )
+
+  if (nrow(sig_df) > 0) {
+    y_pos <- summary_df %>%
+      group_by(Timepoint) %>%
+      summarise(max_y = max(Mean + SEM, na.rm = TRUE) * 1.05, .groups = "drop")
+    
+    # Significance additions for perforin graph
+    
+    sig_labels <- left_join(sig_df, y_pos, by = "Timepoint") %>%
+      mutate(label = "*")
+    
+    p <- p + geom_text(
+      data = sig_labels,
+      aes(x = Timepoint, y = max_y, label = label),
+      inherit.aes = FALSE,
+      color = "black",
+      size = 6,
+      fontface = "bold"
+    )
+  }
+
+if (marker == "Perforin") {
+  x0 <- 1
+  x6 <- 4
+  x_mid <- (x0 + x6) / 2
+  
+  bracket_y <- y_max_nice * 0.92
+  bracket_tip <- y_max_nice * 0.90
+  dot_y <- y_max_nice * 0.955
+
+  tip_extension <- 100
+  
+  p <- p +
+    annotate("segment", x = x0, xend = x6, y = bracket_y, yend = bracket_y,
+             color = "black", linewidth = 1) +
+    annotate("segment", x = x0, xend = x0, y = bracket_y, yend = bracket_tip,
+             color = "black", linewidth = 1) +
+    annotate("segment", x = x6, xend = x6, y = bracket_y, yend = bracket_tip,
+             color = "black", linewidth = 1) +
+    annotate("point", x = x_mid, y = dot_y, color = "black", size = 2)
+}
+
+  addWorksheet(wb, marker)
+  print(p)
+  insertPlot(wb, sheet = marker, width = 6, height = 4, startRow = 1, startCol = 1, fileType = "png")
+  tbl <- compute_summary_table(df)
+  writeData(wb, marker, tbl, startRow = 20)
+}
+```
+
+```{r}
+saveWorkbook(wb, output_excel, overwrite = TRUE)
+```
